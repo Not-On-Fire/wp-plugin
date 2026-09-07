@@ -3,7 +3,7 @@
  * Plugin Name: NotOnFire WordPress Monitor
  * Plugin URI:  https://notonfire.systems
  * Description: Early fatal-error reporting and authenticated WordPress update status for NotOnFire.
- * Version:     0.2.0
+ * Version:     0.3.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * License:     GPL-2.0-or-later
@@ -37,7 +37,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
     final class WP_NotOnFire_Monitor {
 
-        const VERSION = '0.2.0';
+        const VERSION = '0.3.0';
         const OPTION_KEY = 'wp_notonfire_monitor_state';
         const CONFIG_ENDPOINT = '/api/v1/wordpress/error-tracking-config';
         const REST_NAMESPACE = 'notonfire/v1';
@@ -171,6 +171,42 @@ if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
             return true;
         }
 
+        /**
+         * The core version WordPress is offering, or an empty string when it
+         * is already current.
+         *
+         * Read straight off the `update_core` transient rather than through
+         * `get_preferred_from_update_core()`, which lives in
+         * wp-admin/includes/update.php and is not loaded on a REST request.
+         * The transient carries one entry per offer — an `upgrade` row for a
+         * newer release, `latest` for the installed one, and `development`
+         * for a nightly — so the first `upgrade` row is the pending update.
+         *
+         * An absent transient means `wp_version_check()` has not run yet, not
+         * that the site is current. That reads the same as up to date here,
+         * which is the same assumption the plugin and theme counts above
+         * already make.
+         */
+        private static function core_update_version() {
+            $core = get_site_transient( 'update_core' );
+
+            if ( ! isset( $core->updates ) || ! is_array( $core->updates ) ) {
+                return '';
+            }
+
+            foreach ( $core->updates as $update ) {
+                if ( ! isset( $update->response ) || 'upgrade' !== $update->response ) {
+                    continue;
+                }
+
+                if ( isset( $update->current ) && is_string( $update->current ) && '' !== $update->current ) {
+                    return $update->current;
+                }
+            }
+
+            return '';
+        }
+
         public static function monitoring_status() {
             global $wp_version;
 
@@ -221,8 +257,12 @@ if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
                 }
             }
 
+            $core_update_version = self::core_update_version();
+
             $response = new WP_REST_Response( [
                 'version' => (string) $wp_version,
+                'core_updates' => '' === $core_update_version ? 0 : 1,
+                'core_update_version' => $core_update_version,
                 'plugin_updates' => $plugin_update_count,
                 'theme_updates' => $theme_update_count,
                 'plugin_update_names' => array_values( array_unique( $plugin_update_names ) ),

@@ -3,7 +3,7 @@
  * Plugin Name: NotOnFire WordPress Monitor
  * Plugin URI:  https://notonfire.systems
  * Description: Early fatal-error reporting and authenticated WordPress update status for NotOnFire.
- * Version:     0.3.0
+ * Version:     0.4.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * License:     GPL-2.0-or-later
@@ -23,6 +23,9 @@
  *
  * The managed error-tracking DSN is synchronized from NotOnFire and cached in
  * WordPress. WP_NOTONFIRE_DSN may be defined to override it explicitly.
+ *
+ * A fatal error that cannot reach GlitchTip is kept in
+ * wp-content/notonfire-spool for up to 24 hours and sent by a later request.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -37,7 +40,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
     final class WP_NotOnFire_Monitor {
 
-        const VERSION = '0.3.0';
+        const VERSION = '0.4.0';
         const OPTION_KEY = 'wp_notonfire_monitor_state';
         const CONFIG_ENDPOINT = '/api/v1/wordpress/error-tracking-config';
         const REST_NAMESPACE = 'notonfire/v1';
@@ -46,6 +49,12 @@ if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
         const CONFIG_RETRY_INTERVAL = 300;
         const NONCE_TTL = 600;
         const MAX_CLOCK_SKEW = 300;
+        const SPOOL_DIRECTORY = 'notonfire-spool';
+        const SPOOL_GUARD = "<?php exit; ?>\n";
+        const SPOOL_MAX_EVENTS = 50;
+        const SPOOL_MAX_AGE = 86400;
+        const SPOOL_REPLAY_BATCH = 5;
+        const SPOOL_REPLAY_INTERVAL = 60;
 
         private static $capturing = false;
         private static $dsn = '';
@@ -74,6 +83,8 @@ if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
 
             $error = error_get_last();
             if ( ! is_array( $error ) || ! isset( $error['type'] ) || ! self::is_fatal_error_type( (int) $error['type'] ) ) {
+                self::maybe_replay_spool();
+
                 return;
             }
 
@@ -95,27 +106,13 @@ if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
                 return;
             }
 
-            $envelope_header = json_encode(
-                [ 'event_id' => $event_id, 'dsn' => self::$dsn ],
-                JSON_UNESCAPED_SLASHES
-            );
-            $item_header = json_encode( [
-                'type' => 'event',
-                'length' => strlen( $event_json ),
-                'content_type' => 'application/json',
-            ], JSON_UNESCAPED_SLASHES );
+            $status = self::send_event( $event_id, $event_json );
 
-            if ( ! is_string( $envelope_header ) || ! is_string( $item_header ) ) {
-                return;
-            }
-
-            $status = self::send_envelope(
-                self::$envelope_endpoint,
-                $envelope_header . "\n" . $item_header . "\n" . $event_json
-            );
-
-            if ( $status < 200 || $status >= 300 ) {
-                self::debug_log( 'GlitchTip rejected or did not receive the fatal event (HTTP ' . $status . ').' );
+            if ( self::should_retry( $status ) ) {
+                self::debug_log( 'GlitchTip did not receive the fatal event (HTTP ' . $status . '). Keeping it for a later request.' );
+                self::spool_event( $event_id, $event_json );
+            } elseif ( $status < 200 || $status >= 300 ) {
+                self::debug_log( 'GlitchTip rejected the fatal event (HTTP ' . $status . ').' );
             }
         }
 
@@ -321,6 +318,11 @@ if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
 
             self::$dsn = self::configured_dsn();
             self::$envelope_endpoint = self::envelope_endpoint( self::$dsn );
+
+            // Error tracking was switched off, so kept events must not be sent later.
+            if ( 'disabled' === $configuration_state && '' === self::$envelope_endpoint ) {
+                self::discard_spool();
+            }
         }
 
         private static function request_configuration() {
@@ -621,6 +623,222 @@ if ( ! class_exists( 'WP_NotOnFire_Monitor', false ) ) {
             }
 
             return 0;
+        }
+
+        /**
+         * Sends one fatal event as a Sentry envelope. Returns the HTTP status,
+         * 0 when nothing answered, or -1 when the envelope could not be built.
+         */
+        private static function send_event( $event_id, $event_json ) {
+            $envelope_header = json_encode(
+                [ 'event_id' => $event_id, 'dsn' => self::$dsn ],
+                JSON_UNESCAPED_SLASHES
+            );
+            $item_header = json_encode( [
+                'type' => 'event',
+                'length' => strlen( $event_json ),
+                'content_type' => 'application/json',
+            ], JSON_UNESCAPED_SLASHES );
+
+            if ( ! is_string( $envelope_header ) || ! is_string( $item_header ) ) {
+                return -1;
+            }
+
+            return self::send_envelope(
+                self::$envelope_endpoint,
+                $envelope_header . "\n" . $item_header . "\n" . $event_json
+            );
+        }
+
+        /**
+         * Only a malformed or oversized event is dropped. Everything else is
+         * kept until it ages out, including an unreachable host, every 5xx and
+         * a 401: dropping loses the error for good, and a rotated key heals
+         * once the next configuration sync brings the new DSN.
+         */
+        private static function should_retry( $status ) {
+            if ( $status < 0 || ( $status >= 200 && $status < 300 ) ) {
+                return false;
+            }
+
+            return ! in_array( $status, [ 400, 413, 422 ], true );
+        }
+
+        /**
+         * Keeps a fatal event that did not reach GlitchTip until a later
+         * request can send it.
+         *
+         * Files rather than an option, because the database may be what
+         * failed. Only the event is stored and the envelope is rebuilt at
+         * replay, so a rotated DSN does not strand it. wp-content is usually
+         * served, so the directory is private to the PHP user, closed to
+         * Apache, has no listing, and every file starts with an exit guard.
+         */
+        private static function spool_event( $event_id, $event_json ) {
+            $directory = self::spool_directory();
+            if ( '' === $directory || ! ctype_xdigit( (string) $event_id ) ) {
+                return;
+            }
+
+            if ( ! is_dir( $directory ) && ! @mkdir( $directory, 0700, true ) && ! is_dir( $directory ) ) {
+                self::debug_log( 'The fatal event was lost because ' . $directory . ' could not be created.' );
+
+                return;
+            }
+
+            if ( ! is_file( $directory . '/index.php' ) ) {
+                @file_put_contents( $directory . '/index.php', "<?php\n// Silence is golden.\n" );
+            }
+            if ( ! is_file( $directory . '/.htaccess' ) ) {
+                @file_put_contents( $directory . '/.htaccess', "<IfModule mod_authz_core.c>\n\tRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n\tDeny from all\n</IfModule>\n" );
+            }
+
+            if ( count( self::spooled_files( $directory ) ) >= self::SPOOL_MAX_EVENTS ) {
+                self::debug_log( 'The fatal event was lost because ' . self::SPOOL_MAX_EVENTS . ' events are already waiting.' );
+
+                return;
+            }
+
+            // Written aside and renamed, so a replay never reads half a file.
+            $temporary = $directory . '/event-' . $event_id . '.tmp';
+            if ( false === @file_put_contents( $temporary, self::SPOOL_GUARD . $event_json, LOCK_EX ) ) {
+                self::debug_log( 'The fatal event was lost because it could not be written to ' . $directory . '.' );
+
+                return;
+            }
+
+            @chmod( $temporary, 0600 );
+            if ( ! @rename( $temporary, $directory . '/event-' . $event_id . '.php' ) ) {
+                @unlink( $temporary );
+                self::debug_log( 'The fatal event was lost because it could not be written to ' . $directory . '.' );
+            }
+        }
+
+        /**
+         * Sends up to SPOOL_REPLAY_BATCH kept events, oldest first, and stops
+         * at the first one GlitchTip still does not take.
+         *
+         * Runs at the end of requests without a fatal error, at most once per
+         * SPOOL_REPLAY_INTERVAL. The lock file's mtime is the throttle, so a
+         * site with nothing kept pays one stat per request, and flock keeps
+         * two requests from sending the same event.
+         */
+        private static function maybe_replay_spool() {
+            if ( '' === self::$envelope_endpoint ) {
+                return;
+            }
+
+            $directory = self::spool_directory();
+            if ( '' === $directory || ! is_dir( $directory ) ) {
+                return;
+            }
+
+            $lock_path = $directory . '/replay.lock';
+            $last_replay_at = @filemtime( $lock_path );
+            if ( false !== $last_replay_at && $last_replay_at > time() - self::SPOOL_REPLAY_INTERVAL ) {
+                return;
+            }
+
+            $lock = @fopen( $lock_path, 'c' );
+            if ( false === $lock ) {
+                return;
+            }
+
+            if ( ! flock( $lock, LOCK_EX | LOCK_NB ) ) {
+                fclose( $lock );
+
+                return;
+            }
+
+            @touch( $lock_path );
+
+            $sent = 0;
+            foreach ( self::spooled_files( $directory ) as $path ) {
+                if ( $sent >= self::SPOOL_REPLAY_BATCH ) {
+                    break;
+                }
+
+                $event_json = self::read_spooled_event( $path );
+                if ( '' === $event_json ) {
+                    @unlink( $path );
+                    continue;
+                }
+
+                $sent++;
+                $status = self::send_event( substr( basename( $path, '.php' ), strlen( 'event-' ) ), $event_json );
+                if ( self::should_retry( $status ) ) {
+                    break;
+                }
+
+                @unlink( $path );
+            }
+
+            flock( $lock, LOCK_UN );
+            fclose( $lock );
+        }
+
+        /**
+         * Kept events, oldest first. Anything older than SPOOL_MAX_AGE is
+         * deleted on the way.
+         *
+         * @return string[]
+         */
+        private static function spooled_files( $directory ) {
+            $paths = glob( $directory . '/event-*.php' );
+            if ( ! is_array( $paths ) ) {
+                return [];
+            }
+
+            $expires_before = time() - self::SPOOL_MAX_AGE;
+            $kept = [];
+            foreach ( $paths as $path ) {
+                $modified_at = @filemtime( $path );
+                if ( false === $modified_at ) {
+                    continue;
+                }
+
+                if ( $modified_at < $expires_before ) {
+                    @unlink( $path );
+                    continue;
+                }
+
+                $kept[ $path ] = $modified_at;
+            }
+
+            asort( $kept );
+
+            return array_keys( $kept );
+        }
+
+        private static function read_spooled_event( $path ) {
+            $contents = @file_get_contents( $path );
+            if ( ! is_string( $contents ) || 0 !== strpos( $contents, self::SPOOL_GUARD ) ) {
+                return '';
+            }
+
+            $event_json = (string) substr( $contents, strlen( self::SPOOL_GUARD ) );
+
+            return is_array( json_decode( $event_json, true ) ) ? $event_json : '';
+        }
+
+        private static function discard_spool() {
+            $directory = self::spool_directory();
+            if ( '' === $directory || ! is_dir( $directory ) ) {
+                return;
+            }
+
+            $paths = glob( $directory . '/event-*.php' );
+            foreach ( is_array( $paths ) ? $paths : [] as $path ) {
+                @unlink( $path );
+            }
+        }
+
+        private static function spool_directory() {
+            if ( ! defined( 'WP_CONTENT_DIR' ) ) {
+                return '';
+            }
+
+            return rtrim( (string) WP_CONTENT_DIR, '/\\' ) . '/' . self::SPOOL_DIRECTORY;
         }
 
         private static function sentry_auth_header() {

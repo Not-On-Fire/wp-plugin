@@ -18,6 +18,19 @@ wp-content/mu-plugins/000-wp-notonfire.php
 Must-use plugins load before regular plugins and the active theme, which is what
 lets the reporter survive a broken theme.
 
+## When GlitchTip is unreachable
+
+A fatal error that cannot be delivered is kept in `wp-content/notonfire-spool/`
+and sent by a later request, at most once a minute and five events at a time.
+Only a 400, 413 or 422 drops an event; a network error, a 401 or any 5xx keeps
+it. At most 50 events wait, none longer than 24 hours, and the spool is
+discarded when the dashboard reports error tracking as disabled.
+
+Files rather than the database, because the database may be what failed. The
+directory is created `0700`, carries an `index.php` and a deny-all `.htaccess`,
+and every event file starts with `<?php exit; ?>`. If `wp-content` is not
+writable, events are lost as before and `WP_DEBUG` logs why.
+
 Configuring it by hand works too: define `WP_NOTONFIRE_SERVER_URL`,
 `WP_NOTONFIRE_SITE_ID` and `WP_NOTONFIRE_SITE_TOKEN` in `wp-config.php`, or
 export them as environment variables. The `define()` calls the dashboard writes

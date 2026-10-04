@@ -1,6 +1,6 @@
 {
     "name": "notonfire/wp-plugin",
-    "description": "NotOnFire WordPress Monitor: the must-use plugin that reports early fatal errors and authenticated WordPress update status.",
+    "description": "NotOnFire for WordPress: the plugin that reports fatal errors, authenticated WordPress update status and analytics. Carried as a package so the dashboard can serve it.",
     "type": "library",
     "license": "GPL-2.0-or-later",
     "homepage": "https://github.com/Not-On-Fire/wp-plugin",

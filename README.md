@@ -75,6 +75,34 @@ directory is created `0700`, carries an `index.php` and a deny-all `.htaccess`,
 and every event file starts with `<?php exit; ?>`. If `wp-content` is not
 writable, events are lost and `WP_DEBUG` logs why.
 
+## What the monitoring endpoint reports
+
+Since 1.1.0 the signed `/wp-json/notonfire/v1/monitoring` answer carries, next
+to the WordPress version and the pending update counts it always had, the PHP
+version, every installed plugin (slug, name, version, active, pending update
+and its version) and every installed theme (the same, plus the parent of a
+child theme). The dashboard keeps the inventory only for applications with
+WordPress maintenance switched on; the plugin sends it either way, so turning
+maintenance on needs nothing on the site.
+
+Another plugin on the site can add what only it knows through the
+`notonfire_monitoring_payload` filter, under its own key in `extensions`:
+
+```php
+add_filter( 'notonfire_monitoring_payload', function ( array $payload ): array {
+    $payload['extensions']['my-plugin'] = [
+        'name'    => 'My Plugin',
+        'version' => '1.2.3',
+        'checks'  => [ 'Hardening rule' => true, 'Another rule' => false ],
+    ];
+
+    return $payload;
+} );
+```
+
+The dashboard shows the name, the version and how many checks pass. It does
+not know the plugins by name, and it bounds everything on its way in.
+
 ## Updates
 
 The plugin is not on WordPress.org. Its `Update URI` header makes WordPress ask

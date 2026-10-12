@@ -83,7 +83,7 @@ if ( ! class_exists( 'NotOnFire_Updater', false ) ) {
                 'requires_php' => null !== $info ? $info['requires_php'] : '',
                 'download_link' => null !== $info ? $info['package'] : '',
                 'sections' => [
-                    'description' => esc_html__( 'Fatal-error reporting, WordPress update status and analytics for NotOnFire.', 'notonfire' ),
+                    'description' => esc_html__( 'Fatal-error reporting, WordPress update status, plugin inventory and analytics for NotOnFire.', 'notonfire' ),
                 ],
             ];
         }

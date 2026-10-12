@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       NotOnFire
  * Plugin URI:        https://notonfire.systems
- * Description:       Fatal-error reporting, WordPress update status and analytics for NotOnFire.
- * Version:           1.0.0
+ * Description:       Fatal-error reporting, WordPress update status, plugin inventory and analytics for NotOnFire.
+ * Version:           1.1.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            NotOnFire

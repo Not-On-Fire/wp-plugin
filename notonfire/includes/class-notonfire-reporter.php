@@ -220,7 +220,7 @@ if ( ! class_exists( 'NotOnFire_Reporter', false ) ) {
 
             $core_update_version = self::core_update_version();
 
-            $response = new WP_REST_Response( [
+            $payload = [
                 'version' => (string) $wp_version,
                 'core_updates' => '' === $core_update_version ? 0 : 1,
                 'core_update_version' => $core_update_version,
@@ -228,10 +228,118 @@ if ( ! class_exists( 'NotOnFire_Reporter', false ) ) {
                 'theme_updates' => $theme_update_count,
                 'plugin_update_names' => array_values( array_unique( $plugin_update_names ) ),
                 'theme_update_names' => array_values( array_unique( $theme_update_names ) ),
-            ], 200 );
+                // Since 1.1.0: what the dashboard's maintenance view reads.
+                // Always sent; the dashboard keeps it only for applications
+                // with WordPress maintenance switched on.
+                'php_version' => PHP_VERSION,
+                'plugins' => self::plugin_inventory( $installed_plugins, $plugin_update_data ),
+                'themes' => self::theme_inventory( $installed_themes, $theme_update_data ),
+                'extensions' => [],
+            ];
+
+            /**
+             * Lets another plugin on this site add what only it knows, under
+             * its own key in `extensions`:
+             *
+             *     $payload['extensions']['my-plugin'] = [
+             *         'name' => 'My Plugin',
+             *         'version' => '1.2.3',
+             *         'checks' => [ 'Hardening rule' => true, 'Another rule' => false ],
+             *     ];
+             *
+             * The dashboard shows the name, the version and how many checks
+             * pass. It does not know the plugins by name, so a plugin that
+             * stops reporting simply disappears from the card. Everything
+             * passes through the dashboard's own limits on its way in.
+             *
+             * @param array $payload The monitoring payload as built above.
+             */
+            $payload = apply_filters( 'notonfire_monitoring_payload', $payload );
+
+            $response = new WP_REST_Response( $payload, 200 );
             $response->header( 'Cache-Control', 'no-store, private' );
 
             return $response;
+        }
+
+        /**
+         * Every installed plugin with its version, whether it is active and
+         * whether WordPress holds an update for it.
+         *
+         * @param array $installed_plugins What get_plugins() returned.
+         * @param array $plugin_update_data The `response` of the update_plugins transient.
+         * @return array<int, array<string, mixed>>
+         */
+        private static function plugin_inventory( array $installed_plugins, array $plugin_update_data ) {
+            $plugins = [];
+
+            foreach ( $installed_plugins as $plugin_file => $data ) {
+                $update = isset( $plugin_update_data[ $plugin_file ] ) ? $plugin_update_data[ $plugin_file ] : null;
+                $new_version = '';
+                if ( is_object( $update ) && isset( $update->new_version ) ) {
+                    $new_version = (string) $update->new_version;
+                } elseif ( is_array( $update ) && isset( $update['new_version'] ) ) {
+                    $new_version = (string) $update['new_version'];
+                }
+
+                $plugins[] = [
+                    'slug' => self::plugin_slug( (string) $plugin_file ),
+                    'name' => isset( $data['Name'] ) ? wp_strip_all_tags( (string) $data['Name'] ) : '',
+                    'version' => isset( $data['Version'] ) ? (string) $data['Version'] : '',
+                    'active' => is_plugin_active( $plugin_file ),
+                    'update_available' => null !== $update,
+                    'new_version' => $new_version,
+                ];
+            }
+
+            return $plugins;
+        }
+
+        /**
+         * Every installed theme. The active one is the stylesheet in use; a
+         * child theme names its parent so the dashboard can show the pair.
+         *
+         * @param array $installed_themes What wp_get_themes() returned.
+         * @param array $theme_update_data The `response` of the update_themes transient.
+         * @return array<int, array<string, mixed>>
+         */
+        private static function theme_inventory( array $installed_themes, array $theme_update_data ) {
+            $themes = [];
+            $active_stylesheet = (string) get_stylesheet();
+
+            foreach ( $installed_themes as $stylesheet => $theme ) {
+                $update = isset( $theme_update_data[ $stylesheet ] ) ? $theme_update_data[ $stylesheet ] : null;
+                $new_version = '';
+                if ( is_array( $update ) && isset( $update['new_version'] ) ) {
+                    $new_version = (string) $update['new_version'];
+                } elseif ( is_object( $update ) && isset( $update->new_version ) ) {
+                    $new_version = (string) $update->new_version;
+                }
+
+                $themes[] = [
+                    'slug' => (string) $stylesheet,
+                    'name' => wp_strip_all_tags( (string) $theme->get( 'Name' ) ),
+                    'version' => (string) $theme->get( 'Version' ),
+                    'active' => (string) $stylesheet === $active_stylesheet,
+                    'parent' => $theme->parent() ? (string) $theme->get_template() : '',
+                    'update_available' => null !== $update,
+                    'new_version' => $new_version,
+                ];
+            }
+
+            return $themes;
+        }
+
+        /**
+         * The directory a plugin lives in, or the file name of a single-file
+         * plugin: the same identifier WordPress.org uses for it.
+         */
+        private static function plugin_slug( $plugin_file ) {
+            if ( false !== strpos( $plugin_file, '/' ) ) {
+                return dirname( $plugin_file );
+            }
+
+            return preg_replace( '/\.php$/', '', $plugin_file );
         }
 
         public static function maybe_sync() {

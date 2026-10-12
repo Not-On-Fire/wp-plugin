@@ -19,7 +19,7 @@ if ( ! class_exists( 'NotOnFire_Config', false ) ) {
          * git tag are the same number; the dashboard reads this constant to
          * decide whether a site is behind.
          */
-        const VERSION = '1.0.0';
+        const VERSION = '1.1.0';
 
         const SETTINGS_OPTION = 'notonfire_settings';
         const STATE_OPTION = 'notonfire_state';
